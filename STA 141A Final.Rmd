@@ -1,0 +1,545 @@
+---
+title: "STA 141A Final Project"
+author: "Lucky Chong"
+SID: 919572917
+professor: Dr. Shizhe Chen
+date: "2025-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Abstract
+This project is based on a research by Steinmetz et. al, where he examined mice performance in a behavioral task. The data was collected on various factors such as brain areas, neural activity, and stimuli. The goal of this dataset is to explore the data, extract meaningful insights, and integrate the findings to develop a predictive model. This integrated data is used to build a prediction model in order to predict if the mice had a successful trial. Further research and analysis for this research will help improve the accuracy of the predicted model and any other additional questions that are left unanswered.  
+
+# Introduction
+The study takes place for 10 mice across 39 separate sessions; however, in this experiment, we will be only analyzing 4 mice and 18 sessions. For each trial of the session, the mice were presented with images to their left and right, as well as both their left and their right, or neither their left nor their right. Images were presented at one of four contrast levels: 0, 0.25, 0.50 and 1. A water reward was used in order to help ensure engagement of the mice in the task, and a white noise was presented when mice choice was incorrect. Feedback after each trial was recorded, with a 1 recorded if the mice turned the wheel toward the higher contrast or in the case of no image, kept the wheel still. If unsuccessful, the water reward was held back and a -1 was recorded for feedback.
+  
+This project will analyze data using R from just four of the ten mice across 18 of the 39 sessions. This project seeks to build a predictive model that will predict the outcome of each trial, whether the trial was a success or a failure.
+  
+
+# **Exploratory Data Analysis** 
+
+To tackle this dataset, we will start looking at the data for each session and analyze patterns in the trials in order to develop a deeper understanding of this research. This will allow us to comprehend the trends that are ongoing in this dataset. 
+```{r, include=FALSE}
+library(tidyverse)
+library(readr)        
+library(dplyr)         
+library(ggplot2)  
+library(knitr)
+library(lubridate)
+library(caret) 
+library(xgboost)
+library(pROC)
+```
+
+```{r}
+session <- list()
+for(i in 1:18) {
+  session[[i]] <- readRDS(paste0("session", i, ".rds"))  
+}
+
+get_trail_data <- function(session_id, trial_id) {
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))) {
+    print("Value missing in trial", trial_id, "of session", session_id)
+  }
+  
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes)) %>%
+    add_column("brain_area" = session[[session_id]]$brain_area) %>%
+    group_by(brain_area) %>%
+    summarize(region_sum_spike = sum(neuron_spike), 
+              region_count = n(),
+              region_mean_spike = mean(neuron_spike),
+              .groups = "drop") %>%
+    add_column("session_id" = session_id,
+               "trial_id" = trial_id,
+               "contrast_left" = session[[session_id]]$contrast_left[trial_id],
+               "contrast_right" = session[[session_id]]$contrast_right[trial_id],
+               "feedback_type" = session[[session_id]]$feedback_type[trial_id])
+  
+  return(trail_tibble)
+}
+
+trial_data <- bind_rows(lapply(1:18, function(session_id) {
+  trials <- seq_along(session[[session_id]]$spks)  
+  bind_rows(lapply(trials, function(trial_id) {
+    get_trail_data(session_id, trial_id)
+  }))
+}))
+
+df <- trial_data %>%
+  select(session_id, trial_id, feedback_type, contrast_left, contrast_right)
+
+df_summary <- df %>%
+  group_by(feedback_type) %>%
+  summarise(n = n(), .groups = 'drop')
+
+ggplot(df, aes(x = contrast_left, fill = feedback_type)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.6, position = "identity") +
+  geom_histogram(data = df, aes(x = contrast_right, fill = feedback_type), 
+                 binwidth = 0.05, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("Success" = "lightpink", "Failure" = "skyblue")) +
+  labs(title = "Contrast Distribution for Success vs Failure",
+       x = "Contrast Level", y = "Count", fill = "Feedback Type") +
+  theme_minimal()
+
+```
+
+The data is neural spike activity recorded during trials in an experiment session. There are several trials in each session where neural activity (spikes) from various brain regions is recorded. The objective appears to be to compare how neural activity changes according to varying experimental conditions, specifically the contrast levels and types of feedback given during each trial.
+
+```{r}
+df_cleaned <- df %>%
+  filter(!is.na(contrast_left) & !is.na(contrast_right))
+
+sum(is.na(df_cleaned$contrast_left))  
+sum(is.na(df_cleaned$contrast_right))  
+df_cleaned$feedback_type <- factor(df_cleaned$feedback_type, levels = c("Success", "Failure"))
+
+df_long <- df_cleaned %>%
+  pivot_longer(cols = c(contrast_left, contrast_right), 
+               names_to = "contrast_type", 
+               values_to = "contrast_value")
+
+ggplot(df_long, aes(x = contrast_value, fill = feedback_type)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("Success" = "lightpink", "Failure" = "skyblue")) +
+  labs(title = "Contrast Distribution for Success vs Failure",
+       x = "Contrast Level", y = "Count", fill = "Feedback Type") +
+  theme_minimal() +
+  facet_wrap(~contrast_type, ncol = 1) 
+
+
+```
+The purpose is to observe how the contrast distribution of left and right levels varies with respect to the feedback type (Success vs. Failure). The histograms allow you to visually compare the contrasts for successful and failed trials, which can reveal trends such as whether higher or lower contrast is associated with specific types of feedback.
+
+```{r}
+session <- list()
+for(i in 1:18) {
+  session[[i]] <- readRDS(paste0("session", i, ".rds"))  
+}
+
+
+
+ggplot(df, aes(x = contrast_left, fill = feedback_type)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.6, position = "identity") +
+  geom_histogram(data = df, aes(x = contrast_right, fill = feedback_type), 
+                 binwidth = 0.05, alpha = 0.6, position = "identity") +
+  labs(title = "Contrast Distribution for Success vs Failure",
+       x = "Contrast Level", y = "Count", fill = "Feedback Type") +
+  theme_minimal()
+
+```
+The purpose of this analysis appears is to examine whether there is a correlation between contrast levels and feedback type in an experiment. The histograms will allow you to visually observe whether changing contrast levels are likely to lead to success or failure, and this will provide valuable insights into the experiment design, the subject's decision-making, or the validity of the contrast manipulation in influencing performance.
+
+```{r}
+session <- list()
+for(i in 1:18) {
+  session[[i]] <- readRDS(paste0("session", i, ".rds"))  
+}
+
+get_trail_data <- function(session_id, trial_id) {
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))) {
+    print("Value missing in trial", trial_id, "of session", session_id)
+  }
+  
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes)) %>%
+    add_column("brain_area" = session[[session_id]]$brain_area) %>%
+    group_by(brain_area) %>%
+    summarize(region_sum_spike = sum(neuron_spike), 
+              region_count = n(),
+              region_mean_spike = mean(neuron_spike),
+              .groups = "drop") %>%
+    add_column("session_id" = session_id,
+               "trial_id" = trial_id,
+               "contrast_left" = session[[session_id]]$contrast_left[trial_id],
+               "contrast_right" = session[[session_id]]$contrast_right[trial_id],
+               "feedback_type" = session[[session_id]]$feedback_type[trial_id])
+  
+  return(trail_tibble)
+}
+
+trial_data <- bind_rows(lapply(1:18, function(session_id) {
+  trials <- seq_along(session[[session_id]]$spks)  
+  bind_rows(lapply(trials, function(trial_id) {
+    get_trail_data(session_id, trial_id)
+  }))
+}))
+
+full_functional_tibble <- trial_data
+
+neuron_count_summary <- full_functional_tibble %>%
+  group_by(session_id) %>%
+  summarise(neuron_count = sum(region_count))
+
+ggplot(neuron_count_summary, aes(x = session_id, y = neuron_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Neuron Count per Session", x = "Session ID", y = "Neuron Count")
+```
+This plot and analysis of summary are intended to graphically illustrate the distribution of neuronal involvement by experimental sessions. From the total number of neurons involved per session, deducing how neural activity varies depending on the session conditions, experimental design, or complexity.
+
+```{r}
+brain_area_summary <- full_functional_tibble %>%
+  group_by(session_id) %>%
+  summarise(unique_areas = n_distinct(brain_area))
+
+ggplot(brain_area_summary, aes(x = session_id, y = unique_areas)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  labs(title = "Unique Brain Areas per Session", x = "Session ID", y = "Unique Brain Areas")
+
+```
+The objective here is to compare the number of unique brain regions used in each session of an experiment. The data is grouped by session, and the number of unique brain regions across the group is calculated. The bar plot generated shows the number of unique brain regions per session, with session IDs on the x-axis and the number of unique brain regions on the y-axis.
+
+```{r}
+mean_spike_summary <- full_functional_tibble %>%
+  group_by(session_id) %>%
+  summarise(mean_spike_rate = mean(region_mean_spike, na.rm = TRUE))
+
+ggplot(mean_spike_summary, aes(x = session_id, y = mean_spike_rate)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Mean Spike Rate per Session", x = "Session ID", y = "Mean Spike Rate")
+
+
+```
+The analysis highlights the neural activity for each session, with a higher mean spike rate reflecting greater neural firing or activity within the areas of the brain in a session.
+
+```{r}
+success_rate_summary <- full_functional_tibble %>%
+  group_by(session_id) %>%
+  summarise(success_rate = mean(feedback_type == 1, na.rm = TRUE))
+
+ggplot(success_rate_summary, aes(x = session_id, y = success_rate)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  labs(title = "Success Rate per Session", x = "Session ID", y = "Success Rate")
+
+
+```
+Higher success rates reflect better performance or better conditions during those sessions. Visualization via this data helps identify trends or patterns of performance, indicating if there were better results for some sessions.
+
+```{r}
+trial_bin_summary <- full_functional_tibble %>%
+  mutate(trial_bin = ntile(trial_id, 25)) %>%
+  group_by(trial_bin) %>%
+  summarise(success_rate = mean(feedback_type == 1, na.rm = TRUE))
+
+ggplot(trial_bin_summary, aes(x = trial_bin, y = success_rate)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  labs(title = "Success Rate Change Over Time (Binned by Trial ID)", x = "Trial Bin", y = "Success Rate")
+
+
+```
+
+The y-axis would show the success rate for each bin, while the x-axis would be used to represent the trial bins or different portions of the experiment. The graph would be shaded blue for the line and red for the points to provide a very good glimpse of the trend in successes with time.
+
+```{r}
+colnames(full_functional_tibble)
+
+sum(is.na(full_functional_tibble$contrast_right))
+sum(is.na(full_functional_tibble$contrast_left))
+
+full_functional_tibble_clean <- full_functional_tibble %>%
+  filter(!is.na(contrast_right) & !is.na(contrast_left))
+
+subset_data <- full_functional_tibble_clean[, c("contrast_right", "contrast_left")]
+
+summary(subset_data)
+
+```
+This code revolves around cleaning up the dataset and summarizing contrast values for the left and right contrasts. The first step checks for missing contrast_right and contrast_left values by using the sum(is.na()) function. If missing, they are then removed in the second step. Once the data is cleaned, a subset of the correct columns (contrast_right and contrast_left) is taken, and these two columns are summarized using the summary() function. This provides valuable statistics like the minimum, maximum, mean, and median of both contrasts. The output gives details about the range and distribution of the contrast values within the dataset and helps to establish if the contrasts are within valid limits and if further data reprocessing is required.
+
+```{r}
+n.session=length(session)
+
+meta <- tibble(
+  Mouse_name = rep('name',n.session),
+  Date_exp =rep('dt',n.session),
+  Number_of_brain_areas = rep(0,n.session),
+  Number_of_neurons = rep(0,n.session),
+  Number_of_trials = rep(0,n.session),
+  Overall_success_rate = rep(0,n.session),
+)
+
+
+for(i in 1:n.session){
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+
+unique_brain_areas <- c()
+for(i in 1:n.session){
+  unique_brain_areas <- c(unique_brain_areas ,unique(session[[i]]$brain_area))
+  unique_brain_areas <-unique(unique_brain_areas)
+}
+
+length(unique_brain_areas)
+kable(meta, format = "html", caption= "Mice Session Overview", col.names = gsub("[_]", " ", names(meta)), table.attr = "class='table table-striped'",digits=2) 
+summary(meta$Number_of_trials)
+summary(meta$Number_of_neurons)
+summary(meta$Number_of_brain)
+
+```
+
+The code aggregates significant metadata from 18 sessions in the session list. The code starts by setting up a tibble meta to store data such as the mouse name, experiment date, number of unique brain areas, neurons, trials, and overall success rate per session. The loop iterates through each session, and the relevant data are pulled and calculated. It also retrieves all unique brain areas from all sessions and provides the total different number of areas. This code gives you an overview of the experimental data.
+
+# Data Integration
+
+```{r, echo=FALSE}
+get_trail_data <- function(session_id, trial_id) {
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))) {
+    print("Value missing in trial", trial_id, "of session", session_id)
+  }
+  
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes)) %>%
+    add_column("brain_area" = session[[session_id]]$brain_area) %>%
+    group_by(brain_area) %>%
+    summarize(region_sum_spike = sum(neuron_spike), 
+              region_count = n(),
+              region_mean_spike = mean(neuron_spike),
+              .groups = "drop") %>%
+    add_column("session_id" = session_id,
+               "trial_id" = trial_id,
+               "contrast_left" = session[[session_id]]$contrast_left[trial_id],
+               "contrast_right" = session[[session_id]]$contrast_right[trial_id],
+               "feedback_type" = session[[session_id]]$feedback_type[trial_id])
+  
+  return(trail_tibble)
+}
+
+trial_data <- bind_rows(lapply(1:18, function(session_id) {
+  trials <- seq_along(session[[session_id]]$spks)  
+  bind_rows(lapply(trials, function(trial_id) {
+    get_trail_data(session_id, trial_id)
+  }))
+}))
+
+full_functional_tibble <- trial_data
+
+
+session_all <- full_functional_tibble %>%
+  
+  group_by(session_id, trial_id) %>%
+  mutate(spks_mean = mean(region_mean_spike),
+         spks_sd = sd(region_mean_spike)) %>%
+  
+  distinct(session_id, trial_id, contrast_left, contrast_right, spks_mean, spks_sd) %>%
+ 
+  rename(session_number = session_id)
+
+
+str(session_all)
+
+cat("contrast_left exists: ",
+    "contrast_left" %in%
+      names(session_all), "\n")
+cat("contrast_right exists: ",
+    "contrast_right" %in%
+      names(session_all), "\n")
+cat("spks_mean exists: ",
+    "spks_mean" %in%
+      names(session_all), "\n")
+cat("spks_sd exists: ",
+    "spks_sd" %in%
+      names(session_all), "\n")
+
+PCA.data = session_all[, c("contrast_left", "contrast_right", "spks_mean", "spks_sd")]
+PCA.data = scale(PCA.data)
+
+PCA.result = prcomp(PCA.data, scale. = TRUE)
+
+summary(PCA.result)
+
+PCA.df = as.data.frame(PCA.result$x)
+
+PCA.df$session_number = session_all$session_number
+
+ggplot(PCA.df, aes(x = PC1, y = PC2, color = as.factor(session_number))) + 
+  geom_point() + 
+  labs(color = "Session Number") + 
+  theme_minimal() + 
+  ggtitle("PCA Plot")
+
+```
+A scatter plot is generated to show the first two principal components (PC1 and PC2) by different session numbers, providing an overall impression of how sessions differ based on the principal components.
+
+# Predictive Modeling
+```{r}
+full_functional_tibble <- full_functional_tibble %>%
+  mutate(label = ifelse(feedback_type == 1, 1, 0))
+
+predictive_dat <- full_functional_tibble %>%
+  select(session_id, trial_id, contrast_left, contrast_right, 
+         region_sum_spike, region_count, region_mean_spike, brain_area, label)
+
+brain_area_features <- full_functional_tibble %>%
+  select(session_id, trial_id, brain_area, region_mean_spike) %>%
+  pivot_wider(names_from = brain_area, 
+              values_from = region_mean_spike,
+              values_fill = 0)
+
+X_df <- full_functional_tibble %>%
+  select(session_id, trial_id, contrast_left, contrast_right) %>%
+  distinct() %>%
+  left_join(brain_area_features, by = c("session_id", "trial_id"))
+
+X <- X_df %>%
+  select(-session_id, -trial_id) %>%
+  as.matrix()
+
+label <- full_functional_tibble %>%
+  select(session_id, trial_id, feedback_type) %>%
+  distinct() %>%
+  arrange(session_id, trial_id) %>%
+  pull(feedback_type)
+
+set.seed(123) 
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+train_label <- ifelse(train_label == 1, 1, 0)
+test_label <- ifelse(test_label == 1, 1, 0)
+
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+
+auroc <- roc(test_label, predictions)
+auroc
+```
+Thie code divides data into a training (80%) and a test (20%) set, preparing labels for binary classification. The program fits a model based on XGBoost with logistic regression, makes predictions on the test set, and verifies model accuracy. A confusion matrix is established to establish performance, and the Area Under the ROC Curve (AUROC) is found to establish the ability of the model to distinguish between classes.
+
+# Prediction Performance on the Test Sets
+```{r}
+test1 <- readRDS("C:/Users/14155/Downloads/test1.rds")
+test2 <- readRDS("C:/Users/14155/Downloads/test2.rds")
+
+head(test1)
+head(test2)
+
+```
+New datasets from test 1 and test 2
+
+```{r}
+full_data <- full_functional_tibble %>%
+  mutate(row_id = row_number())
+
+predictive_dat <- full_data %>%
+  select(row_id, session_id, trial_id, contrast_left, contrast_right, 
+         region_sum_spike, region_count, region_mean_spike, brain_area, feedback_type)
+
+brain_area_features <- full_data %>%
+  select(row_id, session_id, trial_id, brain_area, region_mean_spike) %>%
+  pivot_wider(names_from = brain_area, 
+              values_from = region_mean_spike,
+              values_fill = 0)
+
+
+X_df <- full_data %>%
+  select(row_id, session_id, trial_id, contrast_left, contrast_right) %>%
+  distinct() %>%
+  left_join(brain_area_features, by = c("row_id", "session_id", "trial_id"))
+
+label_df <- full_data %>%
+  select(row_id, feedback_type) %>%
+  distinct()
+
+set.seed(123)
+session_18_indices <- which(X_df$session_id == 18)
+testIndex <- sample(session_18_indices, min(50, length(session_18_indices)), replace = FALSE)
+trainIndex <- setdiff(1:nrow(X_df), testIndex)
+
+X <- X_df %>%
+  select(-row_id, -session_id, -trial_id) %>%
+  as.matrix()
+
+
+label <- label_df$feedback_type
+
+
+train_X <- X[trainIndex,]
+test_X <- X[testIndex,]
+train_label <- label[trainIndex]
+test_label <- label[testIndex]
+
+train_label <- ifelse(train_label == 1, 1, 0)
+test_label <- ifelse(test_label == 1, 1, 0)
+
+xgb_model <- xgboost(data = train_X, label = train_label, 
+                     objective = "binary:logistic", nrounds=10)
+
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+
+accuracy <- mean(predicted_labels == test_label)
+print(paste("Accuracy:", accuracy))
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+print(conf_matrix$table)
+
+auroc <- roc(test_label, predictions)
+print(auroc)
+```
+This code splits the dataset into training and test sets, where the test is on session 18. It trains an XGBoost binary classification model using logistic regression on the training data and makes predictions on the test set. The accuracy of the model is ascertained, along with a confusion matrix to evaluate the performance. It also computes the AUROC to identify how effectively the model is able to differentiate between classes.
+
+
+```{r}
+set.seed(123)
+session_1_row <- which(full_functional_tibble$session_id==1)
+testIndex <- sample(session_1_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+train_label <- ifelse(train_label == 1, 1, 0)
+test_label <- ifelse(test_label == 1, 1, 0)
+
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+Same thing for session 1.
+
+
+# Discussion
+
+The XGBoost model for the prediction of mice trial outcomes showed variable performance according to a number of measures of assessment. With 71.06% baseline accuracy and an AUROC value of 0.6912, the model has moderate ability but suggests potential overfitting. Cross-session testing revealed good performance discrepancies where it shows Session 1 was better with 74% accuracy and 0.692 AUROC than Session 18 with a 72% accuracy and 0.6144 AUROC. Session 18 also suggests that it has trouble correctly identifying true negatives. These patterns collectively suggest that the model can make assured accurate predictions in certain cases but fail to have complete identification capacity over both types of outcomes. This reveals a need for model enhancement to better account for session-specific attributes and optimize the trade-off between sensitivity and specificity.
+
+# Reference 
+
+ChatGPT for debugging and ideas, Professor/TA demo, Lecture notes, Homework Assignments
